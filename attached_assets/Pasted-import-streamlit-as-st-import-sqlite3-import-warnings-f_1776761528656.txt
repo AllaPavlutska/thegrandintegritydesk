@@ -1,0 +1,568 @@
+import streamlit as st
+import sqlite3
+import warnings
+from urllib.parse import urlparse
+from typing import Tuple
+from newspaper import Article
+
+# --- Configuration Constants ---
+
+# 1. The General Blacklist (Known Bad Actors & Fake News)
+# Source: Based on various academic misinformation tracking lists.
+# Last reviewed: 2025
+GENERAL_BLACKLIST = frozenset({
+    '21stcenturywire.com', 'abcnews.com.co', 'abeldanger.net', 'abovetopsecret.com',
+    'activistpost.com', 'adobochronicles.com', 'ahtribune.com', 'allnewspipeline.com',
+    'americannews.com', 'americasfreedomfighters.com', 'amren.com', 'amtvmedia.com',
+    'awdnews.com', 'barenakedislam.com', 'clickhole.com', 'coasttocoastam.com',
+    'corbettreport.com', 'darkmoon.me', 'davidduke.com', 'davidstockmanscontracorner.com',
+    'davidwolfe.com', 'dcclothesline.com', 'defenddemocracy.press', 'dennismichaellynch.com',
+    'departed.co', 'der-postillon.com', 'fromthetrenchesworldreport.com',
+    'frontpagemag.com', 'galacticconnection.com', 'globalresearch.ca', 'infowars.com',
+    'intrepidreport.com', 'legorafi.fr', 'madworldnews.com', 'naturalnews.com',
+    'newstarget.com', 'presstv.ir', 'prisonplanet.com', 'projectveritas.com',
+    'returnofkings.com', 'shiftfrequency.com', 'thedailysheeple.com',
+    'theeconomiccollapseblog.com', 'thefreethoughtproject.com', 'themindunleashed.com',
+    'theonion.com', 'thepeoplescube.com', 'therussophile.org', 'thesaker.is',
+    'thetruthseeker.co.uk', 'theunrealtimes.com', 'topinfopost.com', 'veteranstoday.com',
+    'voltairenet.org', 'washingtonsblog.com', 'westernjournalism.com',
+    'whatreallyhappened.com'
+})
+
+# 2. State Media / Specific Restricted Domains
+RUSSIAN_STATE_MEDIA_BLACKLIST = frozenset({
+    'rt.com', 'sputniknews.com', 'tass.com', 'rbth.com'
+})
+
+# 3. The Heuristic Lexicon — used for pattern matching only.
+# NOTE: This is a rule-based heuristic, not a machine learning model.
+# Scores are thresholds, not statistical probabilities.
+TRIGGER_PHRASES = frozenset([
+    "guaranteed returns", "double your money", "risk-free investment", "crypto giveaway",
+    "send to this wallet", "get rich quick", "secret wealth system", "banks hate this",
+    "hidden loophole", "financial elite", "make thousands overnight", "passive income secret",
+    "pump and dump", "unlimited cash", "secret algorithm", "earn from home guaranteed",
+    "bitcoin doubler", "elon musk giveaway", "secret bank account", "tax free millions",
+    "cash app hack", "venmo glitch", "zero risk trading", "insider trading secret",
+    "miracle cure", "doctors don't want you to know", "secret remedy", "big pharma hiding",
+    "instant weight loss", "melt fat overnight", "reverse aging instantly", "cure cancer naturally",
+    "suppressed medical truth", "magical healing", "detox your liver in hours", "100% natural cure",
+    "banned supplement", "fountain of youth", "secret ancient remedy", "parasite cleanse",
+    "vaccine microchip", "dna altering", "shed pounds instantly", "the cure they are hiding",
+    "disease free forever", "miracle pill", "health industry secret", "forbidden cure",
+    "shocking truth", "you won't believe", "what happened next", "they don't want you to know",
+    "secret exposed", "banned video", "act now", "before it's deleted", "truth revealed",
+    "mind-blowing", "viral secret", "leaked document", "the media is hiding", "absolute proof",
+    "destroying the internet", "this will make you cry", "everyone is wrong about", "hidden camera",
+    "the ultimate secret", "don't ignore this", "warning to all", "emergency broadcast",
+    "share immediately", "censored by big tech", "the real reason why", "what they aren't telling you",
+    "deep state", "illuminati", "new world order", "lizard people", "fake moon landing",
+    "flat earth proof", "mind control waves", "secret bunker", "chemtrail poison", "global elite",
+    "shadow government", "staged event", "crisis actors", "false flag operation", "secret society",
+    "5g mind control", "population control agenda", "the great reset", "sheeple", "wake up america",
+    "secret alien pact", "hidden history", "the matrix is real", "simulation theory proof",
+    "reptilian overlords", "secret pedo ring", "hollywood elites", "cloned politicians",
+    "rigged election", "stolen votes", "dead people voted", "voting machine hacked",
+    "fake ballots found", "election interference proof", "destroying democracy", "illegal voters",
+    "ballot dumping", "secret vote count", "whistleblower exposes election", "election fraud caught",
+    "destroying our country", "the radical agenda", "brainwashing our children", "secret marxist plot",
+    "they are coming for your", "banning the bible", "mandatory microchips", "cashless society trap",
+    "social credit score coming", "forced quarantine camps", "the end of freedom", "martial law imminent",
+    "click here to claim", "congratulations you won", "claim your prize", "urgent account update",
+    "password compromised click link", "your package is delayed click", "gift card generator"
+])
+
+warnings.filterwarnings('ignore')
+
+
+# ---------------------------------------------------------------------------
+# Input Validation
+# ---------------------------------------------------------------------------
+
+def validate_url(url: str) -> Tuple[bool, str]:
+    """
+    Validates a URL before any network request is made.
+    Returns (is_valid, error_message).
+    """
+    url = url.strip()
+    if not url:
+        return False, "The Inspector requires a valid URL before proceedings may begin."
+
+    if not url.startswith(("http://", "https://")):
+        return False, "All submitted documents must bear a proper address — beginning with http:// or https://"
+
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc or '.' not in parsed.netloc:
+            return False, "The domain portion of this address appears to be missing or malformed."
+        hostname = parsed.hostname or ""
+        if hostname in ("localhost", "127.0.0.1", "0.0.0.0") \
+                or hostname.startswith("192.168.") \
+                or hostname.startswith("10."):
+            return False, "Local and private network addresses are strictly forbidden by hotel policy."
+        return True, ""
+    except Exception:
+        return False, "The address could not be parsed. Kindly verify the format and resubmit."
+
+
+# ---------------------------------------------------------------------------
+# Database Manager
+# ---------------------------------------------------------------------------
+
+class DatabaseManager:
+    """Handles SQLite database lifecycle and persistence."""
+
+    def __init__(self, db_name: str = "safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self) -> None:
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    hit_count INTEGER DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_url ON detections(url)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON detections(timestamp)')
+            conn.commit()
+
+    def log_detection(self, url: str, title: str, is_misinfo: int,
+                      confidence: float, hit_count: int = 0) -> None:
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score, hit_count)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence), hit_count))
+            conn.commit()
+
+    def get_recent_detections(self, limit: int = 15):
+        """Fetch the most recent scan records for the registry view."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT url, article_title, is_misinfo, confidence_score, timestamp
+                FROM detections
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+            return cursor.fetchall()
+
+    def get_stats(self):
+        """Return aggregate stats: total scans and flagged count."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*), SUM(is_misinfo) FROM detections')
+            row = cursor.fetchone()
+            total = row[0] or 0
+            flagged = int(row[1] or 0)
+            return total, flagged
+
+
+# ---------------------------------------------------------------------------
+# Heuristic Analysis Engine
+# ---------------------------------------------------------------------------
+
+class HeuristicEngine:
+    """
+    Evaluates text content against domain reputation and heuristic risk patterns.
+
+    IMPORTANT: This is a rule-based heuristic system, NOT a machine learning model.
+    Verdicts are based on keyword matching and domain blocklists.
+    Results should be treated as a preliminary indicator, not a definitive fact-check.
+    """
+
+    def __init__(self):
+        self.blacklisted_domains = GENERAL_BLACKLIST.union(RUSSIAN_STATE_MEDIA_BLACKLIST)
+        self.trigger_phrases = TRIGGER_PHRASES
+
+    def check_domain_rules(self, url: str) -> bool:
+        """Returns True if the URL's domain is on a restricted list."""
+        try:
+            hostname = urlparse(url).hostname or ""
+            return any(domain in hostname for domain in self.blacklisted_domains)
+        except Exception:
+            return False
+
+    def extract_text(self, url: str) -> Tuple[str, str]:
+        """
+        Downloads and parses article content.
+        Raises descriptive, thematically appropriate errors for specific failure modes.
+        """
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+        except Exception as e:
+            err = str(e).lower()
+            if "404" in err or "not found" in err:
+                raise ValueError(
+                    "The document could not be located — the page returned a 404. "
+                    "Please verify the address and resubmit."
+                )
+            elif "timeout" in err or "timed out" in err:
+                raise ValueError(
+                    "The Inspector's messenger has returned empty-handed. "
+                    "The remote server did not respond in time."
+                )
+            elif "403" in err or "forbidden" in err:
+                raise ValueError(
+                    "Entry refused. The establishment has denied access — "
+                    "this page may be paywalled or blocking automated visitors."
+                )
+            elif "ssl" in err or "certificate" in err:
+                raise ValueError(
+                    "The document's credentials could not be verified. "
+                    "An SSL certificate error was encountered."
+                )
+            else:
+                raise ValueError(
+                    f"The document retrieval has encountered an unforeseen complication: {str(e)}"
+                )
+
+        if not article.text or len(article.text.strip()) < 50:
+            raise ValueError(
+                "The retrieved document contains very little readable text. "
+                "It may be rendered by JavaScript, concealed behind a paywall, or require a login."
+            )
+
+        return article.title or "Untitled Document", article.text
+
+    def analyze(self, text: str) -> Tuple[int, float, int]:
+        """
+        Runs heuristic analysis on text content.
+        Returns (is_misinfo, heuristic_score, hit_count).
+
+        Scoring rationale (heuristic thresholds, not statistical probabilities):
+          0 hits  -> Likely authentic        (score: 0.95)
+          1 hit   -> Low suspicion, cleared  (score: 0.40)
+          2 hits  -> Moderate suspicion      (score: 0.65)
+          3+ hits -> High suspicion          (score: 0.85)
+        """
+        if not text.strip():
+            raise ValueError("The article appears to be empty or inaccessible.")
+
+        text_lower = text.lower()
+        hit_count = sum(1 for phrase in self.trigger_phrases if phrase in text_lower)
+
+        if hit_count == 0:
+            return 0, 0.95, 0
+        elif hit_count == 1:
+            return 0, 0.40, hit_count  # A single phrase hit is insufficient to condemn
+        elif hit_count == 2:
+            return 1, 0.65, hit_count
+        else:
+            return 1, 0.85, hit_count
+
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
+
+def inject_custom_css() -> None:
+    """Injects styling for the Grand Information Hotel aesthetic."""
+    st.markdown("""
+    <style>
+    .stApp { background-color: #F5D3D6; }
+
+    html, body, p, div, span, li {
+        font-family: 'Georgia', serif !important;
+        color: #3B2A20 !important;
+    }
+
+    h1 {
+        text-align: center;
+        color: #C25953 !important;
+        font-family: 'Georgia', serif;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 4px;
+        border-bottom: 3px double #C25953;
+        padding-bottom: 15px;
+        margin-bottom: 20px;
+    }
+
+    .subtitle {
+        text-align: center;
+        font-style: italic;
+        color: #4A6C6B !important;
+        margin-bottom: 10px;
+    }
+
+    .disclaimer-banner {
+        background-color: #FFF8E7;
+        border-left: 4px solid #E2AD5B;
+        padding: 10px 16px;
+        margin-bottom: 24px;
+        font-size: 0.88rem;
+        color: #6B5040 !important;
+        font-style: italic;
+    }
+
+    div[data-baseweb="input"] {
+        background-color: #A3C9C7 !important;
+        border: 2px solid #4A6C6B !important;
+        border-radius: 0px !important;
+    }
+    div[data-baseweb="input"] input {
+        color: #3B2A20 !important;
+        text-align: center;
+        font-weight: bold;
+        background-color: transparent !important;
+    }
+
+    .stButton > button {
+        background-color: #E2AD5B;
+        color: #3B2A20;
+        border: 2px solid #A67531;
+        border-radius: 0px;
+        font-family: 'Georgia', serif;
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        width: 100%;
+        box-shadow: 4px 4px 0px #A67531;
+        transition: all 0.2s;
+    }
+    .stButton > button:hover {
+        background-color: #D19C4A;
+        transform: translate(2px, 2px);
+        box-shadow: 2px 2px 0px #A67531;
+    }
+
+    [data-testid="stMetricValue"] {
+        color: #C25953 !important;
+        font-family: 'Georgia', serif !important;
+        text-align: center !important;
+        font-weight: bold !important;
+    }
+    [data-testid="stMetricLabel"] {
+        text-align: center !important;
+        text-transform: uppercase !important;
+        letter-spacing: 1.5px !important;
+        color: #4A6C6B !important;
+        font-weight: bold !important;
+    }
+
+    hr { border-top: 2px dashed #C25953 !important; }
+
+    [data-testid="stExpander"] details {
+        background-color: #FDF6E3 !important;
+        border: 2px solid #8C6A50 !important;
+        border-radius: 0px !important;
+        box-shadow: 4px 4px 0px #8C6A50 !important;
+        padding: 10px !important;
+    }
+    [data-testid="stExpander"] summary svg { display: none !important; }
+    [data-testid="stExpander"] summary { position: relative; display: flex; align-items: center; }
+    [data-testid="stExpander"] summary::after {
+        content: "✒";
+        font-size: 1.5rem;
+        position: absolute;
+        right: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        transition: transform 0.3s ease;
+    }
+    [data-testid="stExpander"] details[open] summary::after {
+        transform: translateY(-50%) rotate(180deg);
+    }
+
+    .history-row {
+        background: #FDF6E3;
+        border: 1px solid #8C6A50;
+        padding: 10px 14px;
+        margin-bottom: 6px;
+        font-size: 0.88rem;
+    }
+    .flag-condemned { color: #C25953 !important; font-weight: bold; }
+    .flag-cleared   { color: #4A6C6B !important; font-weight: bold; }
+
+    .method-note {
+        background: #EAF3F3;
+        border: 1px dashed #4A6C6B;
+        padding: 8px 14px;
+        font-size: 0.84rem;
+        color: #4A6C6B !important;
+        font-style: italic;
+        margin-top: 12px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Render Functions
+# ---------------------------------------------------------------------------
+
+def render_verdict(prediction: int, confidence: float, hit_count: int,
+                   title: str, text: str, is_domain_blocked: bool) -> None:
+    """Renders the official result section of a scan."""
+    st.divider()
+    st.markdown(
+        "<h3 style='text-align:center; color:#C25953; font-family:Georgia;'>"
+        "— Official Telegram —"
+        "</h3>",
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        verdict = "CONDEMNED" if prediction == 1 else "CLEARED"
+        st.metric(label="Official Verdict", value=verdict)
+    with col2:
+        st.metric(label="Certainty Score", value=f"{confidence * 100:.0f}%")
+    with col3:
+        st.metric(label="Phrases Flagged", value=str(hit_count))
+
+    if is_domain_blocked:
+        st.warning(
+            "NOTICE: This domain is restricted by the Grand Authority. "
+            "Its publications are not permitted within these walls."
+        )
+    elif prediction == 1:
+        st.error(
+            f"NOTICE: The Inspector has identified {hit_count} suspicious passage(s) "
+            "within the submitted document. This material is hereby flagged for further review."
+        )
+    else:
+        st.success(
+            "NOTICE: The Inspector has found no cause for alarm. "
+            "This document has passed preliminary examination and may circulate freely."
+        )
+
+    st.markdown(
+        "<div class='method-note'>"
+        "<strong>Inspector's Note:</strong> This assessment is produced by rule-based heuristic "
+        "analysis — keyword matching against a curated phrase list and domain registry. "
+        "It is <em>not</em> a machine learning system. Scores are thresholds, not statistical "
+        "probabilities. The Grand Authority recommends corroborating all findings with a "
+        "qualified fact-checker before drawing conclusions."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    with st.expander("Review Confiscated Payload"):
+        st.markdown(f"**Document Title:** {title}")
+        if text and text != "Content extraction bypassed due to domain reputation policy.":
+            st.markdown("**Content Snippet (first 500 characters):**")
+            st.code(text[:500] + ("..." if len(text) > 500 else ""), language=None)
+        else:
+            st.info("No content was extracted for this entry.")
+
+
+def render_history(db_manager: DatabaseManager) -> None:
+    """Renders the inspection registry tab."""
+    total, flagged = db_manager.get_stats()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Documents Inspected", total)
+    col2.metric("Condemned", flagged)
+    col3.metric("Cleared", total - flagged)
+
+    st.divider()
+    rows = db_manager.get_recent_detections(limit=15)
+
+    if not rows:
+        st.info("The registry is empty. No inspections have been conducted.")
+        return
+
+    st.markdown("**Registry of Recent Inspections**")
+    for url, article_title, is_misinfo, confidence, timestamp in rows:
+        flag_class = "flag-condemned" if is_misinfo else "flag-cleared"
+        flag_text  = "CONDEMNED"      if is_misinfo else "CLEARED"
+        short_url  = url[:65] + "..." if len(url) > 65 else url
+        st.markdown(
+            f"<div class='history-row'>"
+            f"<span class='{flag_class}'>[{flag_text}]</span> "
+            f"<strong>{article_title or 'Untitled Document'}</strong><br>"
+            f"<small>{short_url}</small> &nbsp;|&nbsp; "
+            f"Certainty: {confidence * 100:.0f}% &nbsp;|&nbsp; {timestamp}"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(page_title="The Grand Information Hotel", layout="centered")
+    inject_custom_css()
+
+    @st.cache_resource
+    def get_system_components():
+        return HeuristicEngine(), DatabaseManager()
+
+    engine, db = get_system_components()
+
+    st.markdown("<h1>The Grand Integrity Desk</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p class='subtitle'>Please submit the document for formal inspection.</p>",
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        "<div class='disclaimer-banner'>"
+        "<strong>Notice to Guests:</strong> The Grand Integrity Desk employs heuristic analysis only. "
+        "Its findings are preliminary in nature and do not constitute a definitive verdict. "
+        "The management accepts no liability for conclusions drawn without further verification."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    tab_scan, tab_history = st.tabs(["Scan Article", "Inspection Registry"])
+
+    # ---- SCAN TAB ----
+    with tab_scan:
+        url_input = st.text_input(
+            "Target URL",
+            placeholder="— INSERT DOCUMENT ADDRESS HERE —",
+            label_visibility="collapsed"
+        )
+
+        if st.button("Submit for Review", use_container_width=True):
+            is_valid, error_msg = validate_url(url_input)
+            if not is_valid:
+                st.error(error_msg)
+                return
+
+            with st.spinner("The Inspector is reviewing the document..."):
+                try:
+                    is_domain_blocked = engine.check_domain_rules(url_input)
+
+                    if is_domain_blocked:
+                        prediction, confidence, hit_count = 1, 1.0, 0
+                        title = "Restricted Domain"
+                        text  = "Content extraction bypassed due to domain reputation policy."
+                    else:
+                        title, text = engine.extract_text(url_input)
+                        prediction, confidence, hit_count = engine.analyze(text)
+
+                    db.log_detection(url_input, title, prediction, confidence, hit_count)
+                    render_verdict(prediction, confidence, hit_count, title, text, is_domain_blocked)
+
+                except ValueError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"The system has encountered an unforeseen disruption: {str(e)}")
+
+    # ---- HISTORY TAB ----
+    with tab_history:
+        st.markdown(
+            "<h3 style='font-family:Georgia,serif; color:#C25953;'>Inspection Registry</h3>",
+            unsafe_allow_html=True
+        )
+        render_history(db)
+
+
+if __name__ == "__main__":
+    main()

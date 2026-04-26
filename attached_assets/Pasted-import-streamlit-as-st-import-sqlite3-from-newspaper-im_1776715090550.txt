@@ -1,0 +1,280 @@
+import streamlit as st
+import sqlite3
+from newspaper import Article
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+import warnings
+
+# Suppress minor warnings for a clean terminal output
+warnings.filterwarnings('ignore')
+
+# ==========================================
+class DatabaseManager:
+    """Handles all SQLite database connections and queries."""
+    
+    def __init__(self, db_name="safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self):
+        """Creates the database table if it doesn't exist."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def log_detection(self, url, title, is_misinfo, confidence):
+        """Saves a new analysis result into the database."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score)
+                VALUES (?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence)))
+            conn.commit()
+
+# ==========================================
+
+class MisinformationEngine:
+    """Handles text extraction, domain rules, and ML classification."""
+    
+    def __init__(self):
+ 
+        self.blacklisted_domains = [
+            '.ru/',             # Blanket ban on all Russian Top-Level Domains
+            'rt.com',           # Russia Today (State Media)
+            'sputniknews.com',  # Sputnik (State Media)
+            'tass.com',         # TASS News Agency
+            'rbth.com'          # Russia Beyond
+        ]
+        
+  
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.model = LogisticRegression()
+        self._train_micro_model()
+
+    def _train_micro_model(self):
+        """Trains a real ML model on a small dataset."""
+        training_data = [
+            ("Shocking secret cure doctors don't want you to know about!", 1),
+            ("The government is hiding aliens in a secret bunker, act now!", 1),
+            ("Guaranteed crypto returns, send money to this wallet today.", 1),
+            ("The central bank announced a 0.5% interest rate hike today.", 0),
+            ("Researchers published a new peer-reviewed study on climate change.", 0),
+            ("City council votes to approve the new public park funding.", 0)
+        ]
+        texts = [item[0] for item in training_data]
+        labels = [item[1] for item in training_data]
+        
+        X_vectors = self.vectorizer.fit_transform(texts)
+        self.model.fit(X_vectors, labels)
+
+    def check_domain_rules(self, url):
+        """Checks if the URL triggers our hardcoded blacklist."""
+        url_lower = url.lower()
+        for domain in self.blacklisted_domains:
+            if domain in url_lower:
+                return True
+        return False
+
+    def extract_text(self, url):
+        """Scrapes the text and title from a given URL."""
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            return article.title, article.text
+        except Exception as e:
+            raise ValueError("Could not extract content. Please ensure the URL is valid and publicly accessible.")
+
+    def analyze(self, text):
+        """Runs the text through the ML model and returns prediction & confidence."""
+        if not text.strip():
+            raise ValueError("The article appears to be empty or blocked by a paywall.")
+            
+        vectorized_text = self.vectorizer.transform([text])
+        prediction = self.model.predict(vectorized_text)[0]
+        probabilities = self.model.predict_proba(vectorized_text)[0]
+        
+        confidence = probabilities[prediction] 
+        return prediction, confidence
+
+# ==========================================
+
+def main():
+    # Page Setup: Wide layout, stylized title
+    st.set_page_config(page_title="The Grand Information Hotel", layout="centered")
+    
+    # ==========================================
+    # I JUST ADORE WES ANDERSON !!!
+    # ==========================================
+    st.markdown("""
+    <style>
+    /* Main Background - Pastel Pink */
+    .stApp {
+        background-color: #F5D3D6; 
+    }
+    
+    /* Global Typography - Vintage Serif (FIXED EXPANDER BUG HERE) */
+    html, body, p {
+        font-family: 'Georgia', serif !important;
+        color: #3B2A20 !important;
+    }
+    
+    /* The Main Title */
+    h1 {
+        text-align: center;
+        color: #C25953 !important;
+        font-family: 'Georgia', serif;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 4px;
+        border-bottom: 3px double #C25953;
+        padding-bottom: 15px;
+        margin-bottom: 20px;
+    }
+    
+    /* Subtitle */
+    .subtitle {
+        text-align: center;
+        font-style: italic;
+        color: #4A6C6B;
+        margin-bottom: 40px;
+    }
+    
+    /* Symmetrical Mint Green Input Box */
+    div[data-baseweb="input"] {
+        background-color: #A3C9C7;
+        border: 2px solid #4A6C6B;
+        border-radius: 0px; 
+    }
+    div[data-baseweb="input"] input {
+        color: #3B2A20;
+        text-align: center; 
+        font-weight: bold;
+    }
+    div[data-baseweb="input"] input::placeholder {
+        color: #4A6C6B;
+        opacity: 0.8;
+    }
+    
+    /* Mustard Yellow Symmetrical Buttons */
+    .stButton > button {
+        background-color: #E2AD5B;
+        color: #3B2A20;
+        border: 2px solid #A67531;
+        border-radius: 0px;
+        font-family: 'Georgia', serif;
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        width: 100%;
+        box-shadow: 4px 4px 0px #A67531;
+        transition: all 0.2s;
+    }
+    .stButton > button:hover {
+        background-color: #D19C4A;
+        transform: translate(2px, 2px);
+        box-shadow: 2px 2px 0px #A67531;
+        color: #3B2A20;
+    }
+    
+    /* Metrics / Results Box Styling */
+    [data-testid="stMetricValue"] {
+        color: #C25953 !important;
+        font-family: 'Georgia', serif;
+        text-align: center;
+        font-weight: bold;
+    }
+    [data-testid="stMetricLabel"] {
+        text-align: center;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        color: #4A6C6B !important;
+        font-weight: bold;
+    }
+    
+    /* Divider lines */
+    hr {
+        border-top: 2px dashed #C25953;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ==========================================
+
+    @st.cache_resource
+    def load_system():
+        return MisinformationEngine(), DatabaseManager()
+    
+    ml_engine, db_manager = load_system()
+
+    st.markdown("<h1>The Grand Integrity Desk</h1>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitle'>Please submit the document for formal inspection.</p>", unsafe_allow_html=True)
+    
+    url_input = st.text_input("Target URL", placeholder="— INSERT URL HERE —", label_visibility="collapsed")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        analyze_button = st.button("Submit for Review", use_container_width=True)
+
+    if analyze_button:
+        if not url_input:
+            st.error("The Inspector requires a valid URL.")
+            return
+
+        with st.spinner("The Inspector is reviewing the document..."):
+            try:
+                st.divider()
+                st.markdown("<h3 style='text-align:center; color:#C25953; font-family:Georgia;'>— Official Telegram —</h3>", unsafe_allow_html=True)
+                
+                
+                if ml_engine.check_domain_rules(url_input):
+                    prediction = 1
+                    confidence = 1.0
+                    title = "Restricted Domain"
+                    text = "Content extraction bypassed due to domain reputation policy."
+                    
+                    st.warning("NOTICE: This domain is restricted by the Grand Authority.")
+
+                
+                else:
+                    title, text = ml_engine.extract_text(url_input)
+                    prediction, confidence = ml_engine.analyze(text)
+                
+               
+                db_manager.log_detection(url_input, title, prediction, confidence)
+                
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                met_col1, met_col2 = st.columns(2)
+                with met_col1:
+                    if prediction == 1:
+                        st.metric(label="Official Verdict", value="Misinformation")
+                    else:
+                        st.metric(label="Official Verdict", value="Authentic")
+                with met_col2:
+                    st.metric(label="Certainty Score", value=f"{confidence * 100:.1f}%")
+                
+               
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("Review Confiscated Payload"):
+                    st.markdown(f"**Document Title:** {title}")
+                    st.markdown(f"**Content Snippet:** {text[:400]}...")
+
+            except Exception as e:
+                st.error(f"System Disruption: {str(e)}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,258 @@
+import streamlit as st
+import sqlite3
+from newspaper import Article
+import warnings
+
+warnings.filterwarnings('ignore')
+
+class DatabaseManager:
+    """Handles SQLite database connections and query executions."""
+    
+    def __init__(self, db_name="safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self):
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def log_detection(self, url, title, is_misinfo, confidence):
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score)
+                VALUES (?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence)))
+            conn.commit()
+
+
+class MisinformationEngine:
+    """Evaluates content against domain policies and heuristic risk patterns."""
+    
+    def __init__(self):
+        self.blacklisted_domains = ['.ru/', 'rt.com', 'sputniknews.com', 'tass.com', 'rbth.com']
+        
+        self.trigger_phrases = [
+            "guaranteed returns", "double your money", "risk-free investment", "crypto giveaway", 
+            "send to this wallet", "get rich quick", "secret wealth system", "banks hate this", 
+            "hidden loophole", "financial elite", "make thousands overnight", "passive income secret",
+            "pump and dump", "unlimited cash", "secret algorithm", "earn from home guaranteed",
+            "bitcoin doubler", "elon musk giveaway", "secret bank account", "tax free millions",
+            "cash app hack", "venmo glitch", "zero risk trading", "insider trading secret",
+            "miracle cure", "doctors don't want you to know", "secret remedy", "big pharma hiding",
+            "instant weight loss", "melt fat overnight", "reverse aging instantly", "cure cancer naturally",
+            "suppressed medical truth", "magical healing", "detox your liver in hours", "100% natural cure",
+            "banned supplement", "fountain of youth", "secret ancient remedy", "parasite cleanse",
+            "vaccine microchip", "dna altering", "shed pounds instantly", "the cure they are hiding",
+            "disease free forever", "miracle pill", "health industry secret", "forbidden cure",
+            "shocking truth", "you won't believe", "what happened next", "they don't want you to know",
+            "secret exposed", "banned video", "act now", "before it's deleted", "truth revealed",
+            "mind-blowing", "viral secret", "leaked document", "the media is hiding", "absolute proof",
+            "destroying the internet", "this will make you cry", "everyone is wrong about", "hidden camera",
+            "the ultimate secret", "don't ignore this", "warning to all", "emergency broadcast", 
+            "share immediately", "censored by big tech", "the real reason why", "what they aren't telling you",
+            "deep state", "illuminati", "new world order", "lizard people", "fake moon landing",
+            "flat earth proof", "mind control waves", "secret bunker", "chemtrail poison", "global elite",
+            "shadow government", "staged event", "crisis actors", "false flag operation", "secret society",
+            "5g mind control", "population control agenda", "the great reset", "sheeple", "wake up america",
+            "secret alien pact", "hidden history", "the matrix is real", "simulation theory proof",
+            "reptilian overlords", "secret pedo ring", "hollywood elites", "cloned politicians",
+            "rigged election", "stolen votes", "dead people voted", "voting machine hacked",
+            "fake ballots found", "election interference proof", "destroying democracy", "illegal voters",
+            "ballot dumping", "secret vote count", "whistleblower exposes election", "election fraud caught",
+            "destroying our country", "the radical agenda", "brainwashing our children", "secret marxist plot",
+            "they are coming for your", "banning the bible", "mandatory microchips", "cashless society trap",
+            "social credit score coming", "forced quarantine camps", "the end of freedom", "martial law imminent",
+            "click here to claim", "congratulations you won", "claim your prize", "urgent account update",
+            "password compromised click link", "your package is delayed click", "gift card generator"
+        ]
+
+    def check_domain_rules(self, url):
+        url_lower = url.lower()
+        return any(domain in url_lower for domain in self.blacklisted_domains)
+
+    def extract_text(self, url):
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            return article.title, article.text
+        except Exception:
+            raise ValueError("Could not extract content. Please ensure the URL is valid and publicly accessible.")
+
+    def analyze(self, text):
+        if not text.strip():
+            raise ValueError("The article appears to be empty or blocked by a paywall.")
+            
+        text_lower = text.lower()
+        trigger_hits = sum(1 for phrase in self.trigger_phrases if phrase in text_lower)
+                
+        if trigger_hits == 0:
+            return 0, 0.95 
+        elif trigger_hits == 1:
+            return 1, 0.60 
+        elif trigger_hits == 2:
+            return 1, 0.80 
+        else:
+            return 1, 0.99 
+
+
+def main():
+    st.set_page_config(page_title="The Grand Information Hotel", layout="centered")
+    
+    st.markdown("""
+    <style>
+    .stApp {
+        background-color: #F5D3D6; 
+    }
+    
+    html, body, p {
+        font-family: 'Georgia', serif !important;
+        color: #3B2A20 !important;
+    }
+    
+    h1 {
+        text-align: center;
+        color: #C25953 !important;
+        font-family: 'Georgia', serif;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 4px;
+        border-bottom: 3px double #C25953;
+        padding-bottom: 15px;
+        margin-bottom: 20px;
+    }
+    
+    .subtitle {
+        text-align: center;
+        font-style: italic;
+        color: #4A6C6B;
+        margin-bottom: 40px;
+    }
+    
+    div[data-baseweb="input"] {
+        background-color: #A3C9C7;
+        border: 2px solid #4A6C6B;
+        border-radius: 0px; 
+    }
+    div[data-baseweb="input"] input {
+        color: #3B2A20;
+        text-align: center; 
+        font-weight: bold;
+    }
+    div[data-baseweb="input"] input::placeholder {
+        color: #4A6C6B;
+        opacity: 0.8;
+    }
+    
+    .stButton > button {
+        background-color: #E2AD5B;
+        color: #3B2A20;
+        border: 2px solid #A67531;
+        border-radius: 0px;
+        font-family: 'Georgia', serif;
+        font-weight: bold;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        width: 100%;
+        box-shadow: 4px 4px 0px #A67531;
+        transition: all 0.2s;
+    }
+    .stButton > button:hover {
+        background-color: #D19C4A;
+        transform: translate(2px, 2px);
+        box-shadow: 2px 2px 0px #A67531;
+        color: #3B2A20;
+    }
+    
+    [data-testid="stMetricValue"] {
+        color: #C25953 !important;
+        font-family: 'Georgia', serif;
+        text-align: center;
+        font-weight: bold;
+    }
+    [data-testid="stMetricLabel"] {
+        text-align: center;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        color: #4A6C6B !important;
+        font-weight: bold;
+    }
+    
+    hr {
+        border-top: 2px dashed #C25953;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    @st.cache_resource
+    def load_system():
+        return MisinformationEngine(), DatabaseManager()
+    
+    ml_engine, db_manager = load_system()
+
+    st.markdown("<h1>The Grand Integrity Desk</h1>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitle'>Please submit the document for formal inspection.</p>", unsafe_allow_html=True)
+    
+    url_input = st.text_input("Target URL", placeholder="— INSERT URL HERE —", label_visibility="collapsed")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        analyze_button = st.button("Submit for Review", use_container_width=True)
+
+    if analyze_button:
+        if not url_input:
+            st.error("The Inspector requires a valid URL.")
+            return
+
+        with st.spinner("The Inspector is reviewing the document..."):
+            try:
+                st.divider()
+                st.markdown("<h3 style='text-align:center; color:#C25953; font-family:Georgia;'>— Official Telegram —</h3>", unsafe_allow_html=True)
+                
+                if ml_engine.check_domain_rules(url_input):
+                    prediction = 1
+                    confidence = 1.0
+                    title = "Restricted Domain"
+                    text = "Content extraction bypassed due to domain reputation policy."
+                    
+                    st.warning("NOTICE: This domain is restricted by the Grand Authority.")
+
+                else:
+                    title, text = ml_engine.extract_text(url_input)
+                    prediction, confidence = ml_engine.analyze(text)
+                
+                db_manager.log_detection(url_input, title, prediction, confidence)
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                met_col1, met_col2 = st.columns(2)
+                with met_col1:
+                    if prediction == 1:
+                        st.metric(label="Official Verdict", value="Misinformation")
+                    else:
+                        st.metric(label="Official Verdict", value="Authentic")
+                with met_col2:
+                    st.metric(label="Certainty Score", value=f"{confidence * 100:.1f}%")
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("Review Confiscated Payload"):
+                    st.markdown(f"**Document Title:** {title}")
+                    st.markdown(f"**Content Snippet:** {text[:400]}...")
+
+            except Exception as e:
+                st.error(f"System Disruption: {str(e)}")
+
+if __name__ == "__main__":
+    main()

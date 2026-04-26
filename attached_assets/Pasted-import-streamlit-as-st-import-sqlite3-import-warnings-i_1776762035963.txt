@@ -1,0 +1,219 @@
+import streamlit as st
+import sqlite3
+import warnings
+import re
+from typing import Tuple, List, Optional
+from newspaper import Article
+
+# --- Configuration Constants ---
+
+GENERAL_BLACKLIST = frozenset({
+    '21stcenturywire.com', 'abcnews.com.co', 'abeldanger.net', 'abovetopsecret.com', 
+    'activistpost.com', 'adobochronicles.com', 'ahtribune.com', 'allnewspipeline.com', 
+    'americannews.com', 'americasfreedomfighters.com', 'amren.com', 'amtvmedia.com', 
+    'awdnews.com', 'barenakedislam.com', 'clickhole.com', 'coasttocoastam.com', 
+    'corbettreport.com', 'countercurrents.org', 'counterpunch.org', 'darkmoon.me', 
+    'davidduke.com', 'davidstockmanscontracorner.com', 'davidwolfe.com', 'dcclothesline.com', 
+    'defenddemocracy.press', 'dennismichaellynch.com', 'departed.co', 'der-postillon.com', 
+    'fromthetrenchesworldreport.com', 'frontpagemag.com', 'galacticconnection.com', 
+    'globalresearch.ca', 'infowars.com', 'intrepidreport.com', 'legorafi.fr', 
+    'madworldnews.com', 'naturalnews.com', 'newstarget.com', 'presstv.ir', 
+    'prisonplanet.com', 'projectveritas.com', 'returnofkings.com', 'shiftfrequency.com', 
+    'thedailysheeple.com', 'theeconomiccollapseblog.com', 'thefreethoughtproject.com', 
+    'themindunleashed.com', 'theonion.com', 'thepeoplescube.com', 'therussophile.org', 
+    'thesaker.is', 'thetruthseeker.co.uk', 'theunrealtimes.com', 'topinfopost.com', 
+    'veteranstoday.com', 'voltairenet.org', 'washingtonsblog.com', 'westernjournalism.com', 
+    'whatreallyhappened.com'
+})
+
+RUSSIAN_STATE_MEDIA_BLACKLIST = frozenset({
+    '.ru/', 'rt.com', 'sputniknews.com', 'tass.com', 'rbth.com'
+})
+
+TRIGGER_PHRASES = [
+    "guaranteed returns", "double your money", "risk-free investment", "crypto giveaway", 
+    "send to this wallet", "get rich quick", "secret wealth system", "banks hate this", 
+    "hidden loophole", "financial elite", "make thousands overnight", "passive income secret",
+    "pump and dump", "unlimited cash", "secret algorithm", "earn from home guaranteed",
+    "bitcoin doubler", "elon musk giveaway", "secret bank account", "tax free millions",
+    "cash app hack", "venmo glitch", "zero risk trading", "insider trading secret",
+    "miracle cure", "doctors don't want you to know", "secret remedy", "big pharma hiding",
+    "instant weight loss", "melt fat overnight", "reverse aging instantly", "cure cancer naturally",
+    "suppressed medical truth", "magical healing", "detox your liver in hours", "100% natural cure",
+    "banned supplement", "fountain of youth", "secret ancient remedy", "parasite cleanse",
+    "vaccine microchip", "dna altering", "shed pounds instantly", "the cure they are hiding",
+    "disease free forever", "miracle pill", "health industry secret", "forbidden cure",
+    "shocking truth", "you won't believe", "what happened next", "they don't want you to know",
+    "secret exposed", "banned video", "act now", "before it's deleted", "truth revealed",
+    "mind-blowing", "viral secret", "leaked document", "the media is hiding", "absolute proof",
+    "destroying the internet", "this will make you cry", "everyone is wrong about", "hidden camera",
+    "the ultimate secret", "don't ignore this", "warning to all", "emergency broadcast", 
+    "share immediately", "censored by big tech", "the real reason why", "what they aren't telling you",
+    "deep state", "illuminati", "new world order", "lizard people", "fake moon landing",
+    "flat earth proof", "mind control waves", "secret bunker", "chemtrail poison", "global elite",
+    "shadow government", "staged event", "crisis actors", "false flag operation", "secret society",
+    "5g mind control", "population control agenda", "the great reset", "sheeple", "wake up america",
+    "secret alien pact", "hidden history", "the matrix is real", "simulation theory proof",
+    "reptilian overlords", "secret pedo ring", "hollywood elites", "cloned politicians",
+    "rigged election", "stolen votes", "dead people voted", "voting machine hacked",
+    "fake ballots found", "election interference proof", "destroying democracy", "illegal voters",
+    "ballot dumping", "secret vote count", "whistleblower exposes election", "election fraud caught",
+    "destroying our country", "the radical agenda", "brainwashing our children", "secret marxist plot",
+    "they are coming for your", "banning the bible", "mandatory microchips", "cashless society trap",
+    "social credit score coming", "forced quarantine camps", "the end of freedom", "martial law imminent",
+    "click here to claim", "congratulations you won", "claim your prize", "urgent account update",
+    "password compromised click link", "your package is delayed click", "gift card generator"
+]
+
+warnings.filterwarnings('ignore')
+
+class DatabaseManager:
+    """Handles SQLite database lifecycle and persistence."""
+    
+    def __init__(self, db_name: str = "safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self) -> None:
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def log_detection(self, url: str, title: str, is_misinfo: int, confidence: float) -> None:
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score)
+                VALUES (?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence)))
+            conn.commit()
+
+
+class MisinformationEngine:
+    """Evaluates text content against domain reputation and heuristic risk patterns."""
+    
+    def __init__(self):
+        self.blacklisted_domains = GENERAL_BLACKLIST.union(RUSSIAN_STATE_MEDIA_BLACKLIST)
+        self.trigger_phrases = TRIGGER_PHRASES
+
+    def check_domain_rules(self, url: str) -> bool:
+        return any(domain in url.lower() for domain in self.blacklisted_domains)
+
+    def extract_text(self, url: str) -> Tuple[str, str]:
+        """Downloads and parses article content."""
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            if not article.text:
+                raise ValueError("empty")
+            return article.title, article.text
+        except Exception as e:
+            # Re-raise to be handled by the UI
+            raise e
+
+    def analyze(self, text: str) -> Tuple[int, float, int]:
+        """Runs heuristic analysis on text content."""
+        if not text.strip():
+            raise ValueError("empty")
+            
+        text_lower = text.lower()
+        hit_count = sum(1 for phrase in self.trigger_phrases if phrase in text_lower)
+                
+        if hit_count == 0:
+            return 0, 0.95, hit_count
+        elif hit_count == 1:
+            return 1, 0.40, hit_count
+        elif hit_count == 2:
+            return 1, 0.65, hit_count
+        else:
+            return 1, 0.85, hit_count
+
+
+def is_local_url(url: str) -> bool:
+    """Helper to detect local/private network attempts."""
+    local_patterns = [r"localhost", r"127\.0\.0\.1", r"192\.168\.", r"10\.", r"172\.(1[6-9]|2[0-9]|3[0-1])\."]
+    return any(re.search(pattern, url) for pattern in local_patterns)
+
+
+def inject_custom_css() -> None:
+    st.markdown("""
+    <style>
+    .stApp { background-color: #F5D3D6; }
+    html, body, p { font-family: 'Georgia', serif !important; color: #3B2A20 !important; }
+    h1 { text-align: center; color: #C25953 !important; font-weight: 800; text-transform: uppercase; letter-spacing: 4px; border-bottom: 3px double #C25953; padding-bottom: 15px; }
+    .subtitle { text-align: center; font-style: italic; color: #4A6C6B; margin-bottom: 40px; }
+    .stButton > button { background-color: #E2AD5B; color: #3B2A20; border: 2px solid #A67531; border-radius: 0px; font-weight: bold; text-transform: uppercase; letter-spacing: 2px; width: 100%; box-shadow: 4px 4px 0px #A67531; }
+    [data-testid="stMetricValue"] { color: #C25953 !important; font-weight: bold; }
+    [data-testid="stExpander"] summary svg { display: none !important; }
+    [data-testid="stExpander"] details { background-color: #FDF6E3; border: 2px solid #8C6A50; border-radius: 0px; box-shadow: 4px 4px 0px #8C6A50; padding: 10px; }
+    [data-testid="stExpander"] summary::after { content: "✒️"; font-size: 1.5rem; position: absolute; right: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def main():
+    st.set_page_config(page_title="The Grand Information Hotel", layout="centered")
+    inject_custom_css()
+    
+    ml_engine, db_manager = MisinformationEngine(), DatabaseManager()
+
+    st.markdown("<h1>The Grand Integrity Desk</h1>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitle'>Please submit the document for formal inspection.</p>", unsafe_allow_html=True)
+    
+    url_input = st.text_input("Target URL", placeholder="— INSERT URL HERE —", label_visibility="collapsed")
+
+    if st.button("Submit for Review", use_container_width=True):
+        if not url_input:
+            st.error("The Inspector requires a valid URL.")
+            return
+
+        if is_local_url(url_input):
+            st.error("Local and private network addresses are strictly forbidden by hotel policy")
+            return
+
+        with st.spinner("The Inspector is reviewing the document..."):
+            try:
+                if ml_engine.check_domain_rules(url_input):
+                    st.warning("NOTICE: This domain is restricted by the Grand Authority. Its publications are not permitted within these walls.")
+                    return
+
+                title, text = ml_engine.extract_text(url_input)
+                prediction, score, hits = ml_engine.analyze(text)
+                db_manager.log_detection(url_input, title, prediction, score)
+                
+                # Verdict Display
+                st.divider()
+                if prediction == 0:
+                    st.success("The Inspector has found no cause for alarm. This document may circulate freely.")
+                else:
+                    st.error("Official Verdict: Misinformation Detected")
+                
+                col1, col2 = st.columns(2)
+                col2.metric(label="Certainty Score", value=f"{score * 100:.1f}%")
+                
+                with st.expander("Review Confiscated Payload"):
+                    st.markdown(f"**Document Title:** {title}")
+                    st.markdown(f"**Content Snippet:** {text[:400]}...")
+
+            except ValueError:
+                st.error("The Inspector's messenger has returned empty-handed")
+            except Exception:
+                st.error("Entry refused. The establishment has denied access")
+
+    # Disclaimer Footer
+    st.markdown("---")
+    st.caption("Notice to Guests: The Grand Integrity Desk employs heuristic analysis only. Its findings are preliminary in nature and do not constitute a definitive verdict. The management accepts no liability for conclusions drawn without further verification.")
+
+if __name__ == "__main__":
+    main()

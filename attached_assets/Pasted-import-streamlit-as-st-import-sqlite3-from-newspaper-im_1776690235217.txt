@@ -1,0 +1,171 @@
+import streamlit as st
+import sqlite3
+from newspaper import Article
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+import warnings
+
+# Suppress minor warnings for a clean terminal output
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. DATABASE ARCHITECTURE
+# ==========================================
+class DatabaseManager:
+    """Handles all SQLite database connections and queries."""
+    
+    def __init__(self, db_name="safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self):
+        """Creates the database table if it doesn't exist."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def log_detection(self, url, title, is_misinfo, confidence):
+        """Saves a new analysis result into the database."""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score)
+                VALUES (?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence)))
+            conn.commit()
+
+# ==========================================
+# 2. MACHINE LEARNING ENGINE
+# ==========================================
+class MisinformationEngine:
+    """Handles text extraction and ML classification."""
+    
+    def __init__(self):
+        # 1. Initialize the tools
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.model = LogisticRegression()
+        # 2. Train the micro-model on startup
+        self._train_micro_model()
+
+    def _train_micro_model(self):
+        """Trains a real ML model on a small dummy dataset so the app works immediately."""
+        # 0 = Authentic, 1 = Misinformation
+        training_data = [
+            ("Shocking secret cure doctors don't want you to know about!", 1),
+            ("The government is hiding aliens in a secret bunker, act now!", 1),
+            ("Guaranteed crypto returns, send money to this wallet today.", 1),
+            ("The central bank announced a 0.5% interest rate hike today.", 0),
+            ("Researchers published a new peer-reviewed study on climate change.", 0),
+            ("City council votes to approve the new public park funding.", 0)
+        ]
+        
+        texts = [item[0] for item in training_data]
+        labels = [item[1] for item in training_data]
+        
+        # Convert text to numbers and train the model
+        X_vectors = self.vectorizer.fit_transform(texts)
+        self.model.fit(X_vectors, labels)
+
+    def extract_text(self, url):
+        """Scrapes the text and title from a given URL."""
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            return article.title, article.text
+        except Exception as e:
+            raise ValueError("Could not extract content. Please ensure the URL is valid and publicly accessible.")
+
+    def analyze(self, text):
+        """Runs the text through the ML model and returns prediction & confidence."""
+        if not text.strip():
+            raise ValueError("The article appears to be empty or blocked by a paywall.")
+            
+        vectorized_text = self.vectorizer.transform([text])
+        prediction = self.model.predict(vectorized_text)[0]
+        probabilities = self.model.predict_proba(vectorized_text)[0]
+        
+        # Get the confidence of the chosen prediction
+        confidence = probabilities[prediction] 
+        return prediction, confidence
+
+# ==========================================
+# 3. USER INTERFACE (STREAMLIT)
+# ==========================================
+def main():
+    # Page Setup
+    st.set_page_config(page_title="Trust & Safety Pipeline", page_icon="🛡️", layout="centered")
+    
+    # Initialize our classes (Using Streamlit cache so it doesn't retrain on every click)
+    @st.cache_resource
+    def load_system():
+        return MisinformationEngine(), DatabaseManager()
+    
+    ml_engine, db_manager = load_system()
+
+    # UI Header
+    st.title("🛡️ Trust & Safety URL Analyzer")
+    st.markdown("""
+    *Developed as a portfolio project for AI safety and misinformation detection.*
+    Enter an article URL below to evaluate its contents using a Machine Learning classifier.
+    """)
+    st.divider()
+
+    # User Input
+    url_input = st.text_input("Enter Article URL:", placeholder="https://example.com/news-article")
+
+    # Action Button
+    if st.button("Analyze Content", type="primary"):
+        if not url_input:
+            st.warning("Please enter a URL to proceed.")
+            return
+
+        with st.spinner("Scraping and analyzing content..."):
+            try:
+                # 1. Scrape
+                title, text = ml_engine.extract_text(url_input)
+                
+                # 2. Predict
+                prediction, confidence = ml_engine.analyze(text)
+                
+                # 3. Save to SQL
+                db_manager.log_detection(url_input, title, prediction, confidence)
+                
+                # 4. Display Results cleanly
+                st.subheader("Analysis Results")
+                
+                # Use Streamlit columns for a professional layout
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if prediction == 1:
+                        st.error("🚨 Likely Misinformation")
+                    else:
+                        st.success("✅ Likely Authentic")
+                        
+                with col2:
+                    st.metric(label="Model Confidence", value=f"{confidence * 100:.1f}%")
+                
+                # Show extracted data
+                with st.expander("View Extracted Article Data"):
+                    st.write(f"**Title:** {title}")
+                    st.write(f"**Snippet:** {text[:500]}...")
+
+            except Exception as e:
+                # Professional error handling
+                st.error(f"System Error: {str(e)}")
+
+# Run the application
+if __name__ == "__main__":
+    main()

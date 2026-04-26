@@ -1,0 +1,71 @@
+def main():
+    # Page Setup: Wide layout, standard clean font, no emojis
+    st.set_page_config(page_title="Information Integrity Pipeline", layout="centered")
+    
+    @st.cache_resource
+    def load_system():
+        return MisinformationEngine(), DatabaseManager()
+    
+    ml_engine, db_manager = load_system()
+
+    # UI Header: Academic and Minimalist
+    st.markdown("<h1 style='text-align: center; font-weight: 600; color: #1e1e1e;'>Information Integrity Analyzer</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: #555555; margin-bottom: 2rem;'>Automated domain policy and semantic classification pipeline.</p>", unsafe_allow_html=True)
+    
+    # Input Section
+    url_input = st.text_input("Target URL", placeholder="e.g., https://example.com/article", label_visibility="collapsed")
+
+    # Centered Button
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        analyze_button = st.button("Execute Analysis", use_container_width=True)
+
+    if analyze_button:
+        if not url_input:
+            st.error("Error: Target URL required.")
+            return
+
+        with st.spinner("Processing..."):
+            try:
+                st.divider()
+                st.markdown("### Analysis Report")
+                
+                # STEP 1: Policy Check
+                if ml_engine.check_domain_rules(url_input):
+                    prediction = 1
+                    confidence = 1.0
+                    title = "Restricted Domain"
+                    text = "Content extraction bypassed due to domain reputation policy."
+                    
+                    st.markdown("**Status:** Policy Violation")
+                    st.markdown("This domain matches known state-sponsored or restricted media profiles.")
+
+                # STEP 2: ML Analysis
+                else:
+                    title, text = ml_engine.extract_text(url_input)
+                    prediction, confidence = ml_engine.analyze(text)
+                
+                # Save to Database
+                db_manager.log_detection(url_input, title, prediction, confidence)
+                
+                # Results Display: Clean Metrics
+                met_col1, met_col2 = st.columns(2)
+                with met_col1:
+                    if prediction == 1:
+                        st.metric(label="Classification", value="Misinformation")
+                    else:
+                        st.metric(label="Classification", value="Authentic")
+                with met_col2:
+                    st.metric(label="System Confidence", value=f"{confidence * 100:.1f}%")
+                
+                # Clean Data Expander
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("Review Extracted Payload"):
+                    st.markdown(f"**Document Title:** {title}")
+                    st.markdown(f"**Content Snippet:** {text[:400]}...")
+
+            except Exception as e:
+                st.error(f"System Exception: {str(e)}")
+
+if __name__ == "__main__":
+    main()

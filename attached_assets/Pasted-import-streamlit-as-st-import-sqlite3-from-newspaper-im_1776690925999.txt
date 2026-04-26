@@ -1,0 +1,165 @@
+import streamlit as st
+import sqlite3
+from newspaper import Article
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. DATABASE ARCHITECTURE (Unchanged)
+# ==========================================
+class DatabaseManager:
+    def __init__(self, db_name="safety_pipeline.db"):
+        self.db_name = db_name
+        self._initialize_db()
+
+    def _initialize_db(self):
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    article_title TEXT,
+                    is_misinfo INTEGER,
+                    confidence_score REAL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+
+    def log_detection(self, url, title, is_misinfo, confidence):
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO detections (url, article_title, is_misinfo, confidence_score)
+                VALUES (?, ?, ?, ?)
+            ''', (url, title, int(is_misinfo), float(confidence)))
+            conn.commit()
+
+# ==========================================
+# 2. ENHANCED MACHINE LEARNING ENGINE
+# ==========================================
+class MisinformationEngine:
+    def __init__(self):
+        # 1. Define the Rules-Based Blacklist (The "URL Keywords")
+        self.blacklisted_domains = [
+            '.ru/',             # Blanket ban on all Russian Top-Level Domains
+            'rt.com',           # Russia Today (State Media)
+            'sputniknews.com',  # Sputnik (State Media)
+            'tass.com',         # TASS News Agency
+            'rbth.com'          # Russia Beyond
+        ]
+        
+        # 2. Initialize the ML tools
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.model = LogisticRegression()
+        self._train_micro_model()
+
+    def _train_micro_model(self):
+        training_data = [
+            ("Shocking secret cure doctors don't want you to know about!", 1),
+            ("The government is hiding aliens in a secret bunker, act now!", 1),
+            ("Guaranteed crypto returns, send money to this wallet today.", 1),
+            ("The central bank announced a 0.5% interest rate hike today.", 0),
+            ("Researchers published a new peer-reviewed study on climate change.", 0),
+            ("City council votes to approve the new public park funding.", 0)
+        ]
+        texts = [item[0] for item in training_data]
+        labels = [item[1] for item in training_data]
+        X_vectors = self.vectorizer.fit_transform(texts)
+        self.model.fit(X_vectors, labels)
+
+    def check_domain_rules(self, url):
+        """Checks if the URL triggers our hardcoded blacklist."""
+        url_lower = url.lower()
+        for domain in self.blacklisted_domains:
+            if domain in url_lower:
+                return True
+        return False
+
+    def extract_text(self, url):
+        try:
+            article = Article(url)
+            article.download()
+            article.parse()
+            return article.title, article.text
+        except Exception as e:
+            raise ValueError("Could not extract content. Please ensure the URL is valid and publicly accessible.")
+
+    def analyze(self, text):
+        if not text.strip():
+            raise ValueError("The article appears to be empty or blocked by a paywall.")
+        vectorized_text = self.vectorizer.transform([text])
+        prediction = self.model.predict(vectorized_text)[0]
+        probabilities = self.model.predict_proba(vectorized_text)[0]
+        confidence = probabilities[prediction] 
+        return prediction, confidence
+
+# ==========================================
+# 3. USER INTERFACE (STREAMLIT)
+# ==========================================
+def main():
+    st.set_page_config(page_title="Trust & Safety Pipeline", page_icon="🛡️", layout="centered")
+    
+    @st.cache_resource
+    def load_system():
+        return MisinformationEngine(), DatabaseManager()
+    
+    ml_engine, db_manager = load_system()
+
+    st.title("🛡️ Trust & Safety URL Analyzer")
+    st.markdown("""
+    *Developed as a portfolio project for AI safety and misinformation detection.*
+    Enter an article URL below to evaluate its contents using a Hybrid Classifier (Domain Rules + ML Analysis).
+    """)
+    st.divider()
+
+    url_input = st.text_input("Enter Article URL:", placeholder="https://example.com/news-article")
+
+    if st.button("Analyze Content", type="primary"):
+        if not url_input:
+            st.warning("Please enter a URL to proceed.")
+            return
+
+        with st.spinner("Analyzing content..."):
+            try:
+                # STEP 1: The Domain Blacklist Check (Instant Fail)
+                if ml_engine.check_domain_rules(url_input):
+                    prediction = 1
+                    confidence = 1.0 # 100% confidence because it hit a hard rule
+                    title = "Domain Flagged by Policy"
+                    text = "Content was blocked before extraction due to domain reputation policy."
+                    st.warning("⚠️ **Rule Triggered:** This domain matches known state-sponsored or high-risk media profiles.")
+
+                # STEP 2: The ML Fallback (If the domain is safe, read the text)
+                else:
+                    title, text = ml_engine.extract_text(url_input)
+                    prediction, confidence = ml_engine.analyze(text)
+                
+                # Save to SQL
+                db_manager.log_detection(url_input, title, prediction, confidence)
+                
+                # Display Results
+                st.subheader("Analysis Results")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if prediction == 1:
+                        st.error("🚨 Likely Misinformation")
+                    else:
+                        st.success("✅ Likely Authentic")
+                with col2:
+                    st.metric(label="System Confidence", value=f"{confidence * 100:.1f}%")
+                
+                with st.expander("View Extracted Article Data"):
+                    st.write(f"**Title:** {title}")
+                    st.write(f"**Snippet:** {text[:500]}...")
+
+            except Exception as e:
+                st.error(f"System Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
